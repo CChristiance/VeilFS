@@ -1,9 +1,14 @@
-AC_INIT([VeilFS], [1.0])
+AC_INIT([VeilFS], [0.1.0])
 
-AM_INIT_AUTOMAKE([foreign])
-
+AM_INIT_AUTOMAKE([foreign subdir-objects])
 AC_PROG_CC
 
-AC_CONFIG_FILES([Makefile src/Makefile])
+PKG_PROG_PKG_CONFIG
+PKG_CHECK_MODULES([FUSE3], [fuse3 >= 3.0])
+
+AC_CONFIG_FILES([
+    Makefile
+    src/Makefile
+])
 
 AC_OUTPUT
