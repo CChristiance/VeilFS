@@ -1,12 +1,12 @@
 
+#define FUSE_USE_VERSION 31
+
 #include <stdio.h>
 #include <fuse.h>
 #include <dirent.h>
 
 #ifndef _PARAMS_H_
 #define _PARAMS_H_
-
-#define FUSE_USE_VERSION 31
 
 struct vfs_state {
     const char *rootdir;        /* backing directory (usually root) */

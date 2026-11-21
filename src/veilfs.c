@@ -18,8 +18,30 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/fsuid.h>
 #include <sched.h>
 #include <fuse.h>
+
+struct saved_ids { uid_t uid; gid_t gid };
+
+/* ===== HELPER FUNCTIONS ===== */
+
+/* Save uid and gid of daemon; required for each callback modifying the FS
+   Omitting save_ids and restore_ids from such a callback creates a critical vulnerability
+   when running VeilFS as root. */
+static inline const void save_ids(struct saved_ids *s) {
+    struct fuse_context *context = fuse_get_context();
+    s->uid = setfsuid(context->uid);
+    s->gid = setfsgid(context->gid);
+}
+
+/* Restore uid and gid of daemon; required for each callback modifying the FS
+   Omitting save_ids and restore_ids from such a callback creates a critical vulnerability
+   when running VeilFS as root. */
+static inline const void restore_ids(struct saved_ids *s) {
+    setfsuid(s->uid);
+    setfsgid(s->gid);
+}
 
 static inline struct vfs_state *get_state(void) {
     return fuse_get_context()->private_data;
@@ -29,19 +51,25 @@ static inline struct vfs_dirp *get_dirp(struct fuse_file_info *fi) {
     return (struct vfs_dirp *) (uintptr_t) fi->fh;
 }
 
+// strip leading slash, unless path is "\"
 static inline const char *rel_path(const char *path) {
     return (path[1] == '\0') ? "." : path + 1;
 }
 
+static int under_mountpoint(const char *path, const struct vfs_state *state) {
+    size_t n = strlen(state->mountpoint);
+    return strncmp(path, state->mountpoint, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
 /* Mask: 4 = read, 2 = write, 1 = execute */
-static inline const char vfs_can_access(const struct stat *stbuf, const struct fuse_context *context, int mask) {
+static inline const int vfs_can_access(const struct stat *stbuf, const struct fuse_context *context, int mask) {
     if (context->uid == 0) return 1;    // allow root to always access
     
     mode_t bits;
 
     // get the three relevant permission bits (8-6 for uid match, 5-3 for gid match, else 2-0)
     if (context->uid == stbuf->st_uid) bits = (stbuf->st_mode >> 6) & 7;
-    else if (context->gid == stbuf->st_gid) (stbuf->st_mode >> 3) & 7;
+    else if (context->gid == stbuf->st_gid) bits = (stbuf->st_mode >> 3) & 7;
     else bits = stbuf->st_mode & 7;
 
     return (bits & mask) == mask;
@@ -52,41 +80,199 @@ static void *vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   
     unshare(CLONE_NEWNS);   // prevent mount propagation
 
-    cfg->use_ino = 1;
+    // cfg->use_ino = 0;
     cfg->nullpath_ok = 0;   // path is needed when using fstatat, openat, etc.
-    // cfg->entry_timeout = 0;
-    // cfg->attr_timeout = 0;
-    // cfg->negative_timeout = 0;
+    cfg->entry_timeout = 0;
+    cfg->attr_timeout = 0;
+    cfg->negative_timeout = 0;
 
     return fuse_get_context()->private_data;
 
     // return NULL;
 }
 
-// TODO: hide mounting point to prevent recursion
-// TODO: files still show even when required read perms are absent
+/* ===== END OF HELPER FUNCTIONS ===== */
+
 static int vfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
-    // (void) fi;
     int res = 0;
     struct vfs_state *state = get_state();
     struct fuse_context *context = fuse_get_context();  // holds uid, gid, pid, etc. for the calling process
-
-    // (void) path;
     (void) fi;
-
-    // if (fi) res = fstat(fi->fh, stbuf);
-    // else res = lstat(path, stbuf);
     
+    // hide mounting point to prevent recursion
+    if (under_mountpoint(path, state)) return -ENOENT;
+
     // store file information from the real file location into stbuf
     res = fstatat(state->root_fd, rel_path(path), stbuf, AT_SYMLINK_NOFOLLOW);
     if (res == -1) return -errno;
 
     // prevent user from looking up hidden entries by name
-    if (!vfs_can_access(stbuf, context, R_OK)) return -ENOENT;
-
-    // if (fstatat(state->root_fd, rel_path(path), stbuf, AT_SYMLINK_NOFOLLOW)) return -errno;
+    // directories show if they have either read or exec bits, files need read bit
+    if (stbuf->st_mode & S_IFDIR) {
+        if (!vfs_can_access(stbuf, context, R_OK) && 
+            !vfs_can_access(stbuf, context, X_OK)) return -ENOENT;
+    } else {
+        if (!vfs_can_access(stbuf, context, R_OK)) return -ENOENT;
+    }
 
     return 0;
+}
+
+static int vfs_readlink(const char *path, char *buf, size_t size) {
+	int res;
+
+	res = readlink(path, buf, size - 1);
+	if (res == -1)
+		return -errno;
+
+	buf[res] = '\0';
+	return 0;
+}
+
+static int vfs_mknod(const char *path, mode_t mode, dev_t rdev) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	if (S_ISFIFO(mode))
+		res = mkfifo(path, mode);
+	else
+		res = mknod(path, mode, rdev);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_mkdir(const char *path, mode_t mode) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	res = mkdir(path, mode);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_rmdir(const char *path) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	res = rmdir(path);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_symlink(const char *from, const char *to) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	res = symlink(from, to);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_rename(const char *from, const char *to, unsigned int flags) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	if (flags)
+		return -EINVAL;
+
+	res = rename(from, to);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_link(const char *from, const char *to) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	res = link(from, to);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_unlink(const char *path) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	res = unlink(path);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	if(fi)
+		res = fchmod(fi->fh, mode);
+	else
+		res = chmod(path, mode);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	if (fi)
+		res = fchown(fi->fh, uid, gid);
+	else
+		res = lchown(path, uid, gid);
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int res;
+
+	if(fi)
+		res = ftruncate(fi->fh, size);
+	else
+		res = truncate(path, size);
+
+	if (res == -1)
+		return -errno;
+
+    restore_ids(&s);
+	return 0;
 }
 
 static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
@@ -108,6 +294,7 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
     // d->dp = opendir(path);
     if (d->dp == NULL) {
         free(d);
+        close(fd);
         return -errno;
     }
 
@@ -130,25 +317,12 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     struct fuse_context *context = fuse_get_context();
     struct vfs_dirp *d = get_dirp(fi);
     struct stat stbuf;
-    // struct stat *stbuf = &st;
 
     int res;
     // check if user has read permissions
-    // if (fi) res = fstat(fi->fh, stbuf);
-    // point stbuf and stat at the real storage and fd
     if (fi) res = fstat(dirfd(d->dp), &stbuf);
     else res = fstatat(state->root_fd, rel_path(path), &stbuf, AT_SYMLINK_NOFOLLOW);
     if (!vfs_can_access(&stbuf, context, R_OK)) return -ENOENT;
-    // if (res == -1) return -errno;
-    
-    // if (context->uid == stbuf->st_uid) {
-    //     if (!(stbuf->st_mode & S_IRUSR)) return -ENOENT;
-    // } else if (context->gid == stbuf->st_gid) {
-    //     if (!(stbuf->st_mode & S_IRGRP)) return -ENOENT;
-    // } else {
-    //     if (!(stbuf->st_mode & S_IROTH)) return -ENOENT;
-    // }
-    // end of perms check
 
     // int fd = openat(state->root_fd, rel_path(path), O_RDONLY | O_DIRECTORY);
     // if (fd == -1) return -errno;
@@ -167,56 +341,16 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
 
         // never filter out "." and ".."
         if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
+        char full[PATH_MAX];
+        int len = snprintf(full, sizeof(full), "%s%s%s", state->rootdir, (state->rootdir[0] == '/' && state->rootdir[1] == '\0') ? "" : "/", de->d_name);
+        if (len < 0 || (size_t)len >= sizeof(full)) continue;
+            if (under_mountpoint(full, state)) continue; // don't list out mount point
             if (fstatat(dirfd(d->dp), de->d_name, &entst, AT_SYMLINK_NOFOLLOW) == -1) continue;
             if (!vfs_can_access(&entst, context, R_OK)) continue;
         }
         
         filler(buf, de->d_name, NULL, 0, 0);
     }
-
-    return 0;
-
-//     if (offset != d->offset) {
-// #ifndef __FREEBSD__
-//         seekdir(d->dp, offset);
-// #else
-//         seekdir(d->dp, offset-1);
-// #endif
-//         d->entry = NULL;
-//         d->offset = offset;
-//     }
-//     while(1) {
-//         // struct stat st;
-//         off_t nextoff;
-//         enum fuse_fill_dir_flags fill_flags = 0;
-
-//         if (!d->entry) {
-//             d->entry = readdir(d->dp);
-//             if (!d->entry) break;
-//         }
-// #ifdef HAVE_FSTATAT
-//         if (flags & FUSE_READDIR_PLUS) {
-//             int res;
-
-//             res = fstatat(dirfd(d->dp), d->entry->d_name, &st, AT_SYMLINK_NOFOLLOW);
-
-//             if (res != -1) fill_flags |= FUSE_FILL_DIR_PLUS;
-//         }
-// #endif
-//         if(!(fill_flags & FUSE_FILL_DIR_PLUS)) {
-//             memset(&st, 0, sizeof(st));
-//             st.st_ino = d->entry->d_ino;
-//             st.st_mode = d->entry->d_type << 12;
-//         }
-//         nextoff = telldir(d->dp);
-// #ifdef __FREEBSD__
-//         nextoff++;
-// #endif
-//         if (filler(buf, d->entry->d_name, &st, nextoff, fill_flags)) break;
-        
-//         d->entry = NULL;
-//         d->offset = nextoff;
-//     }
 
     return 0;
 }
@@ -241,7 +375,8 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-static int vfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+static int vfs_read(const char *path, char *buf, size_t size, off_t offset, 
+            struct fuse_file_info *fi) {
     (void) path;
 
     // struct vfs_state *state = get_state();
@@ -251,6 +386,46 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t offset, stru
     if (res == -1) return -errno;
 
     return res;
+}
+
+static int vfs_write(const char *path, const char *buf, size_t size, off_t offset, 
+            struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
+
+	int res;
+
+	(void) path;
+	res = pwrite(fi->fh, buf, size, offset);
+	if (res == -1)
+		res = -errno;
+
+    restore_ids(&s);
+	return res;
+}
+
+static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
+	int fd;
+
+	fd = open(path, fi->flags, mode);
+	if (fd == -1)
+		return -errno;
+
+	fi->fh = fd;
+    restore_ids(&s);
+	return 0;
+}
+
+static int vfs_statfs(const char *path, struct statvfs *stbuf) {
+	int res;
+
+	res = statvfs(path, stbuf);
+	if (res == -1)
+		return -errno;
+
+	return 0;
 }
 
 static int vfs_release(const char *path, struct fuse_file_info *fi) {
@@ -265,21 +440,83 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
+// TODO
+static int vfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) {
+	int res;
+	(void) path;
+
+#ifndef HAVE_FDATASYNC
+	(void) isdatasync;
+#else
+	if (isdatasync)
+		res = fdatasync(fi->fh);
+	else
+#endif
+		res = fsync(fi->fh);
+	if (res == -1)
+		return -errno;
+
+	return 0;
+}
+
+// TOOD
+#ifdef HAVE_UTIMENSAT
+static int vfs_utimens(const char *path, const struct timespec ts[2], 
+            struct fuse_file_info *fi) {
+	int res;
+
+	/* don't use utime/utimes since they follow symlinks */
+	if (fi)
+		res = futimens(fi->fh, ts);
+	else
+		res = utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW);
+	if (res == -1)
+		return -errno;
+
+	return 0;
+}
+#endif
+
 static void vfs_usage() {
     // fprintf(stderr, "Usage: veilfs <rootDir> <mountPoint>\n");
     fprintf(stderr, "Usage: veilfs [mountPoint]\n");
     abort();
+
+    // fprintf(stderr, "Usage: veilfs [rootDir] [mountPoint]\n\
+    //         Optional arguments:\n\
+    //         \t-l, --logging         requires root, log certain behavior to /var/log/veilfs/veilfs.log\n\
+    //         \t");
+
+    // abort();
 }
 
 const static struct fuse_operations vfs_oper = {
     .init = vfs_init,
     .getattr = vfs_getattr,
+    .readlink = vfs_readlink,
+    .mknod = vfs_mknod,
+    .mkdir = vfs_mkdir,
+    .rmdir = vfs_rmdir,
+    .symlink = vfs_symlink,
+    .rename = vfs_rename,
+    .link = vfs_link,
+    .unlink = vfs_unlink,
+    .chmod = vfs_chmod,
+    .chown = vfs_chown,
+    .truncate = vfs_truncate,
     .opendir = vfs_opendir,
     .readdir = vfs_readdir,
     .releasedir = vfs_releasedir,
     .open = vfs_open,
     .read = vfs_read,
+    .write = vfs_write,
+    .create = vfs_create,
+    .statfs = vfs_statfs,
     .release = vfs_release,
+    .fsync = vfs_fsync,
+#ifdef HAVE_UTIMENSAT
+    .utimens = vfs_utimens,
+#endif
 };
 
 // TODO: write test cases
@@ -305,33 +542,35 @@ int main(int argc, char *argv[]) {
     // if ((argc < 3) || (argv[argc-2][0] == '-') || (argv[argc-1][0] == '-'))
     //     vfs_usage();
 
-    // TODO: mount on system start instead of requiring manual start
+    // TODO: option to mount on system start instead of requiring manual start
     state->root_fd = open("/", O_PATH | O_DIRECTORY);   // FUSE daemon will serve from root
+    state->rootdir = "/";
+    state->mountpoint = realpath(argv[argc-1], NULL);
+    fprintf(stderr, "mountpoint: %s\n", state->mountpoint);
 
-    // TODO: user has to cd into the mountpoint, make it so they start there
-    // TODO: user can cd out of the mountpoint
-    // TODO: when at mountpoint, the user sees their directory as the mountpoint instead of root
+    // TODO: as an option: user has to cd into the mountpoint, make it so they start there
+    // TODO: launcher to prevent user from cd-ing out of the mountpoint
 
-    umask(0);
+    // umask(0);
 
     // insert -oallow_other, default_permissions into args to allow kernel to also enforce access
-    // struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
-    // for (int i = 0; i < argc; i++) {
-    //     if (fuse_opt_add_arg(&args, argv[i]) == -1) return 1;
-    // }
-    // if (fuse_opt_insert_arg(&args, 1, "-oallow_other,default_permissions") == -1) {
-    //     fprintf(stderr, "Failed to insert args into fuse_args struct, terminating...\n");
-    //     fuse_opt_free_args(&args);
-    //     return 1;
-    // }
+    struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
+    for (int i = 0; i < argc; i++) {
+        if (fuse_opt_add_arg(&args, argv[i]) == -1) return 1;
+    }
+    if (fuse_opt_insert_arg(&args, 1, "-oallow_other,default_permissions") == -1) {
+        fprintf(stderr, "Failed to insert args into fuse_args struct, terminating...\n");
+        fuse_opt_free_args(&args);
+        return 1;
+    }
 
     fprintf(stderr, "Using FUSE library version: %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
     fprintf(stderr, "Calling fuse main...\n");
-    // int ret = fuse_main(args.argc, args.argv, &vfs_oper, state);
+    int ret = fuse_main(args.argc, args.argv, &vfs_oper, state);
 
     // release heap mem owned by args
-    // fuse_opt_free_args(&args);
-    // return ret;
-    return fuse_main(argc, argv, &vfs_oper, state);
+    fuse_opt_free_args(&args);
+    return ret;
+    // return fuse_main(argc, argv, &vfs_oper, state);
 }
