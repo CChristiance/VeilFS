@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "params.h"
+#include "logging.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,12 +44,12 @@ static inline const void restore_ids(struct saved_ids *s) {
     setfsgid(s->gid);
 }
 
-static inline struct vfs_state *get_state(void) {
+static inline struct veilfs_state *get_state(void) {
     return fuse_get_context()->private_data;
 }
 
-static inline struct vfs_dirp *get_dirp(struct fuse_file_info *fi) {
-    return (struct vfs_dirp *) (uintptr_t) fi->fh;
+static inline struct veilfs_dirp *get_dirp(struct fuse_file_info *fi) {
+    return (struct veilfs_dirp *) (uintptr_t) fi->fh;
 }
 
 // strip leading slash, unless path is "\"
@@ -56,13 +57,13 @@ static inline const char *rel_path(const char *path) {
     return (path[1] == '\0') ? "." : path + 1;
 }
 
-static int under_mountpoint(const char *path, const struct vfs_state *state) {
+static int under_mountpoint(const char *path, const struct veilfs_state *state) {
     size_t n = strlen(state->mountpoint);
     return strncmp(path, state->mountpoint, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
 /* Mask: 4 = read, 2 = write, 1 = execute */
-static inline const int vfs_can_access(const struct stat *stbuf, const struct fuse_context *context, int mask) {
+static inline const int veilfs_can_access(const struct stat *stbuf, const struct fuse_context *context, int mask) {
     if (context->uid == 0) return 1;    // allow root to always access
     
     mode_t bits;
@@ -75,13 +76,15 @@ static inline const int vfs_can_access(const struct stat *stbuf, const struct fu
     return (bits & mask) == mask;
 }
 
-static void *vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+static void *veilfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     (void) conn;
   
     unshare(CLONE_NEWNS);   // prevent mount propagation
 
     // cfg->use_ino = 0;
     cfg->nullpath_ok = 0;   // path is needed when using fstatat, openat, etc.
+
+    // needed to keep VeilFS in sync with base filesystem (and disable caching)
     cfg->entry_timeout = 0;
     cfg->attr_timeout = 0;
     cfg->negative_timeout = 0;
@@ -93,9 +96,10 @@ static void *vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
 /* ===== END OF HELPER FUNCTIONS ===== */
 
-static int vfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+static int veilfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    LOG_OP(path);
     int res = 0;
-    struct vfs_state *state = get_state();
+    struct veilfs_state *state = get_state();
     struct fuse_context *context = fuse_get_context();  // holds uid, gid, pid, etc. for the calling process
     (void) fi;
     
@@ -109,16 +113,22 @@ static int vfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_in
     // prevent user from looking up hidden entries by name
     // directories show if they have either read or exec bits, files need read bit
     if (stbuf->st_mode & S_IFDIR) {
-        if (!vfs_can_access(stbuf, context, R_OK) && 
-            !vfs_can_access(stbuf, context, X_OK)) return -ENOENT;
+        if (!veilfs_can_access(stbuf, context, R_OK) && 
+            !veilfs_can_access(stbuf, context, X_OK)) {
+            LOG_OP(path);
+            return -ENOENT;
+        }
     } else {
-        if (!vfs_can_access(stbuf, context, R_OK)) return -ENOENT;
+        if (!veilfs_can_access(stbuf, context, R_OK)) {
+            LOG_OP(path);
+            return -ENOENT;
+        }
     }
 
     return 0;
 }
 
-static int vfs_readlink(const char *path, char *buf, size_t size) {
+static int veilfs_readlink(const char *path, char *buf, size_t size) {
 	int res;
 
 	res = readlink(path, buf, size - 1);
@@ -129,7 +139,7 @@ static int vfs_readlink(const char *path, char *buf, size_t size) {
 	return 0;
 }
 
-static int vfs_mknod(const char *path, mode_t mode, dev_t rdev) {
+static int veilfs_mknod(const char *path, mode_t mode, dev_t rdev) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
@@ -138,53 +148,62 @@ static int vfs_mknod(const char *path, mode_t mode, dev_t rdev) {
 		res = mkfifo(path, mode);
 	else
 		res = mknod(path, mode, rdev);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_mkdir(const char *path, mode_t mode) {
+static int veilfs_mkdir(const char *path, mode_t mode) {
+    struct fuse_context *context = fuse_get_context();
     struct saved_ids *s;
     save_ids(&s);
 	int res;
 
 	res = mkdir(path, mode);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_rmdir(const char *path) {
+static int veilfs_rmdir(const char *path) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
 
 	res = rmdir(path);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_symlink(const char *from, const char *to) {
+static int veilfs_symlink(const char *from, const char *to) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
 
 	res = symlink(from, to);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_rename(const char *from, const char *to, unsigned int flags) {
+static int veilfs_rename(const char *from, const char *to, unsigned int flags) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
@@ -193,40 +212,46 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
 		return -EINVAL;
 
 	res = rename(from, to);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_link(const char *from, const char *to) {
+static int veilfs_link(const char *from, const char *to) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
 
 	res = link(from, to);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_unlink(const char *path) {
+static int veilfs_unlink(const char *path) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
 
 	res = unlink(path);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
+static int veilfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
@@ -235,14 +260,16 @@ static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
 		res = fchmod(fi->fh, mode);
 	else
 		res = chmod(path, mode);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
+static int veilfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
@@ -251,14 +278,16 @@ static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_in
 		res = fchown(fi->fh, uid, gid);
 	else
 		res = lchown(path, uid, gid);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
+static int veilfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     struct saved_ids *s;
     save_ids(&s);
 	int res;
@@ -268,18 +297,20 @@ static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 	else
 		res = truncate(path, size);
 
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
+static int veilfs_opendir(const char *path, struct fuse_file_info *fi) {
     int res;
-    struct vfs_state *state = get_state();
+    struct veilfs_state *state = get_state();
     struct fuse_context *context = fuse_get_context();
-    struct vfs_dirp *d = malloc(sizeof(struct vfs_dirp));
+    struct veilfs_dirp *d = malloc(sizeof(struct veilfs_dirp));
     if (d == NULL) return -ENOMEM;
 
     // get file descriptor
@@ -305,7 +336,7 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+static int veilfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 			struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
 
     // (void) offset;
@@ -313,16 +344,19 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     // (void) flags;
     (void) path;
     
-    struct vfs_state *state = get_state();
+    struct veilfs_state *state = get_state();
     struct fuse_context *context = fuse_get_context();
-    struct vfs_dirp *d = get_dirp(fi);
+    struct veilfs_dirp *d = get_dirp(fi);
     struct stat stbuf;
 
     int res;
     // check if user has read permissions
     if (fi) res = fstat(dirfd(d->dp), &stbuf);
     else res = fstatat(state->root_fd, rel_path(path), &stbuf, AT_SYMLINK_NOFOLLOW);
-    if (!vfs_can_access(&stbuf, context, R_OK)) return -ENOENT;
+    if (!veilfs_can_access(&stbuf, context, R_OK)) {
+        LOG_OP(path);
+        return -ENOENT;
+    }
 
     // int fd = openat(state->root_fd, rel_path(path), O_RDONLY | O_DIRECTORY);
     // if (fd == -1) return -errno;
@@ -346,7 +380,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         if (len < 0 || (size_t)len >= sizeof(full)) continue;
             if (under_mountpoint(full, state)) continue; // don't list out mount point
             if (fstatat(dirfd(d->dp), de->d_name, &entst, AT_SYMLINK_NOFOLLOW) == -1) continue;
-            if (!vfs_can_access(&entst, context, R_OK)) continue;
+            if (!veilfs_can_access(&entst, context, R_OK)) continue;
         }
         
         filler(buf, de->d_name, NULL, 0, 0);
@@ -355,16 +389,16 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     return 0;
 }
 
-static int vfs_releasedir(const char *path, struct fuse_file_info *fi) {
+static int veilfs_releasedir(const char *path, struct fuse_file_info *fi) {
     (void) path;
-    struct vfs_dirp *d = get_dirp(fi);
+    struct veilfs_dirp *d = get_dirp(fi);
     closedir(d->dp);
     free(d);
     return 0;
 }
 
-static int vfs_open(const char *path, struct fuse_file_info *fi) {
-    struct vfs_state *state = get_state();
+static int veilfs_open(const char *path, struct fuse_file_info *fi) {
+    struct veilfs_state *state = get_state();
     int fd;
 
     // fd = open(path, fi->flags);
@@ -375,11 +409,11 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-static int vfs_read(const char *path, char *buf, size_t size, off_t offset, 
+static int veilfs_read(const char *path, char *buf, size_t size, off_t offset, 
             struct fuse_file_info *fi) {
     (void) path;
 
-    // struct vfs_state *state = get_state();
+    // struct veilfs_state *state = get_state();
     int res = 0;
 
     res = pread(fi->fh, buf, size, offset);
@@ -388,7 +422,7 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t offset,
     return res;
 }
 
-static int vfs_write(const char *path, const char *buf, size_t size, off_t offset, 
+static int veilfs_write(const char *path, const char *buf, size_t size, off_t offset, 
             struct fuse_file_info *fi) {
     struct saved_ids *s;
     save_ids(&s);
@@ -397,28 +431,32 @@ static int vfs_write(const char *path, const char *buf, size_t size, off_t offse
 
 	(void) path;
 	res = pwrite(fi->fh, buf, size, offset);
-	if (res == -1)
-		res = -errno;
+	if (res == -1) {
+        restore_ids(&s);
+		return -errno;
+    }
 
     restore_ids(&s);
 	return res;
 }
 
-static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+static int veilfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     struct saved_ids *s;
     save_ids(&s);
 	int fd;
 
 	fd = open(path, fi->flags, mode);
-	if (fd == -1)
+	if (fd == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
 	fi->fh = fd;
     restore_ids(&s);
 	return 0;
 }
 
-static int vfs_statfs(const char *path, struct statvfs *stbuf) {
+static int veilfs_statfs(const char *path, struct statvfs *stbuf) {
 	int res;
 
 	res = statvfs(path, stbuf);
@@ -428,11 +466,11 @@ static int vfs_statfs(const char *path, struct statvfs *stbuf) {
 	return 0;
 }
 
-static int vfs_release(const char *path, struct fuse_file_info *fi) {
+static int veilfs_release(const char *path, struct fuse_file_info *fi) {
     (void) path;
     // (void) fi;
 
-    // struct vfs_state *state = get_state();
+    // struct veilfs_state *state = get_state();
     // close(path);
 
     close(fi->fh);
@@ -441,7 +479,9 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
 }
 
 // TODO
-static int vfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) {
+static int veilfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
 	int res;
 	(void) path;
 
@@ -453,16 +493,21 @@ static int vfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi
 	else
 #endif
 		res = fsync(fi->fh);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
+    restore_ids(&s);
 	return 0;
 }
 
 // TOOD
 #ifdef HAVE_UTIMENSAT
-static int vfs_utimens(const char *path, const struct timespec ts[2], 
+static int veilfs_utimens(const char *path, const struct timespec ts[2], 
             struct fuse_file_info *fi) {
+    struct saved_ids *s;
+    save_ids(&s);
 	int res;
 
 	/* don't use utime/utimes since they follow symlinks */
@@ -470,14 +515,17 @@ static int vfs_utimens(const char *path, const struct timespec ts[2],
 		res = futimens(fi->fh, ts);
 	else
 		res = utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW);
-	if (res == -1)
+	if (res == -1) {
+        restore_ids(&s);
 		return -errno;
+    }
 
+    restore_ids(&s);
 	return 0;
 }
 #endif
 
-static void vfs_usage() {
+static void veilfs_usage() {
     // fprintf(stderr, "Usage: veilfs <rootDir> <mountPoint>\n");
     fprintf(stderr, "Usage: veilfs [mountPoint]\n");
     abort();
@@ -490,32 +538,38 @@ static void vfs_usage() {
     // abort();
 }
 
-const static struct fuse_operations vfs_oper = {
-    .init = vfs_init,
-    .getattr = vfs_getattr,
-    .readlink = vfs_readlink,
-    .mknod = vfs_mknod,
-    .mkdir = vfs_mkdir,
-    .rmdir = vfs_rmdir,
-    .symlink = vfs_symlink,
-    .rename = vfs_rename,
-    .link = vfs_link,
-    .unlink = vfs_unlink,
-    .chmod = vfs_chmod,
-    .chown = vfs_chown,
-    .truncate = vfs_truncate,
-    .opendir = vfs_opendir,
-    .readdir = vfs_readdir,
-    .releasedir = vfs_releasedir,
-    .open = vfs_open,
-    .read = vfs_read,
-    .write = vfs_write,
-    .create = vfs_create,
-    .statfs = vfs_statfs,
-    .release = vfs_release,
-    .fsync = vfs_fsync,
+// clean up filesystem on exit
+static void veilfs_destroy() {
+
+}
+
+const static struct fuse_operations veilfs_oper = {
+    .init = veilfs_init,
+    .getattr = veilfs_getattr,
+    .readlink = veilfs_readlink,
+    .mknod = veilfs_mknod,
+    .mkdir = veilfs_mkdir,
+    .rmdir = veilfs_rmdir,
+    .symlink = veilfs_symlink,
+    .rename = veilfs_rename,
+    .link = veilfs_link,
+    .unlink = veilfs_unlink,
+    .chmod = veilfs_chmod,
+    .chown = veilfs_chown,
+    .truncate = veilfs_truncate,
+    .opendir = veilfs_opendir,
+    .readdir = veilfs_readdir,
+    .releasedir = veilfs_releasedir,
+    .open = veilfs_open,
+    .read = veilfs_read,
+    .write = veilfs_write,
+    .create = veilfs_create,
+    .statfs = veilfs_statfs,
+    .release = veilfs_release,
+    .fsync = veilfs_fsync,
+    .destroy = veilfs_destroy,
 #ifdef HAVE_UTIMENSAT
-    .utimens = vfs_utimens,
+    .utimens = veilfs_utimens,
 #endif
 };
 
@@ -531,18 +585,37 @@ const static struct fuse_operations vfs_oper = {
 int main(int argc, char *argv[]) {
     /* in order for sudo to work, the daemon must have root privileges */
     /* allow the program to run, but send an alert */
+    int fd = -1;
     if ((getuid() != 0) && (geteuid() != 0)) {
-        fprintf(stderr, "FUSE is running without root privileges\n");
+        fprintf(stderr, "VeilFS daemon is running without root privileges, \
+                         certain aspects will not work / are disabled.\n");
     }
 
-    /* by passing vfs_state state into fuse_main, information 
+    /* by passing veilfs_state state into fuse_main, information 
        can be shared across filesystem ops */
-    struct vfs_state *state = calloc(1, sizeof(*state));
+    struct veilfs_state *state = calloc(1, sizeof(*state));
+    state->logpath = LOG_PATH; // TODO: add option for custom logging directories
+
+    struct stat st;
+    if (mkdir(state->logpath, 0700) != 0 &&
+        (errno != EEXIST || stat(state->logpath, &st) != 0 ||
+        !S_ISDIR(st.st_mode) || access(state->logpath, W_OK | X_OK) != 0)) {
+        perror("Log directory");
+        fprintf(stderr, "Logging disabled: could not create/access %s\n", state->logpath);
+    } else {
+        char filepath[PATH_MAX];
+        int len = snprintf(filepath, sizeof(filepath), "%s/veilfs.log", state->logpath);
+        if (len > 0 && (size_t)len < sizeof(filepath)) {
+            fd = open(filepath, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (fd == -1) perror("open log");
+        }
+    }
+
     // sanity check for correct args
     // if ((argc < 3) || (argv[argc-2][0] == '-') || (argv[argc-1][0] == '-'))
-    //     vfs_usage();
+    //     veilfs_usage();
 
-    // TODO: option to mount on system start instead of requiring manual start
+    state->log_fd = fd;
     state->root_fd = open("/", O_PATH | O_DIRECTORY);   // FUSE daemon will serve from root
     state->rootdir = "/";
     state->mountpoint = realpath(argv[argc-1], NULL);
@@ -567,10 +640,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Using FUSE library version: %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
     fprintf(stderr, "Calling fuse main...\n");
-    int ret = fuse_main(args.argc, args.argv, &vfs_oper, state);
+    int ret = fuse_main(args.argc, args.argv, &veilfs_oper, state);
 
     // release heap mem owned by args
     fuse_opt_free_args(&args);
     return ret;
-    // return fuse_main(argc, argv, &vfs_oper, state);
+    // return fuse_main(argc, argv, &veilfs_oper, state);
 }
