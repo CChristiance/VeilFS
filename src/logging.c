@@ -1,7 +1,8 @@
 #include <stdio.h>
-#include <limits.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <fuse.h>
@@ -48,10 +49,10 @@ static int rotate_log_if_needed(struct veilfs_state *state) {
     int len = snprintf(cur, sizeof(cur), "%s/veilfs.log", state->logpath);
     if (len < 0 || (size_t)len >= sizeof(cur)) return fd;
 
-    // find the next unused veilfs_n.log
+    // find the next unused veilfs.log.n
     int n = 1;
     do {
-        len = snprintf(old, sizeof(old), "%s/veilfs_%d.log", state->logpath, n++);
+        len = snprintf(old, sizeof(old), "%s/veilfs.log.%d", state->logpath, n++);
         if (len < 0 || (size_t)len >= sizeof(old)) return fd;
     } while (access(old, F_OK) == 0);
 
@@ -67,10 +68,10 @@ static int rotate_log_if_needed(struct veilfs_state *state) {
 
 // log timestamp, user info, invoked syscall, and file/directory they tried to access
 void veilfs_log(struct fuse_context *context, const char *op, const char *path) {
-    fprintf(stderr, "Logging...\n");
     struct veilfs_state *state = context->private_data;
+    fprintf(stderr, "logpath = %s, log_fd = %d, path = %s\n", state->logpath, state->log_fd, path);
     if (state->log_fd < 0) return;
-    if (path && is_log_path(path, state->logpath)) return
+    if (path && is_log_path(path, state->logpath)) return;
 
     state->log_fd = rotate_log_if_needed(state);
 
@@ -80,6 +81,25 @@ void veilfs_log(struct fuse_context *context, const char *op, const char *path) 
     char cmd[256];
     get_cmdline(context->pid, cmd, sizeof(cmd));
 
+    fprintf(stderr, "Logging: %s - uid=%d pid=%d op=%s path=%s cmd=%s\n",
+            timestamp, context->uid, (int)context->pid, op, path ? path : "-", cmd);
+
     dprintf(state->log_fd, "%s - uid=%d pid=%d op=%s path=%s cmd=%s\n",
             timestamp, context->uid, (int)context->pid, op, path ? path : "-", cmd);
+}
+
+int open_log(const char *dir) {
+    char path[PATH_MAX];
+
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        perror("Log directory");
+        return -1;
+    }
+    if (snprintf(path, sizeof(path), "%s/veilfs.log", dir) >= (int)sizeof(path)) {
+        fprintf(stderr, "Log path too long\n");
+        return -1;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd == -1) perror("open log");
+    return fd;
 }
