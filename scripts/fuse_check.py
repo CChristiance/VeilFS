@@ -349,7 +349,7 @@ def main():
     ap.add_argument("--hide-policy", choices=["veil", "none"], default="veil",
                     help="'none' = oracle for a plain POSIX fs (harness sanity check)")
     ap.add_argument("--order", choices=["no-parent-x", "access-first", "hide-first"],
-                    default="no-parent-x", help="see module docstring")
+                    default="access-first", help="see module docstring")
     ap.add_argument("--gid-match", choices=["primary", "all"], default="primary",
                     help="match entry gid against caller's primary gid only "
                          "(veilfs) or all supplementary groups too")

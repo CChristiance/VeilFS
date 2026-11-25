@@ -51,10 +51,11 @@ fi
 echo "Running VeilFS tests without logging..."
 for i in $(seq 1 $1); do
     python3 ./scripts/gen_tree.py tests/treetest/ --seed $i --depth 10 --max-files 1000 --users alice,bob,carol --manifest tests/tree.json
-    python3 ./scripts/fuse_check.py "$MNT/tests/treetest/" \
-        --manifest "$PWD/tests/tree.json" \
-        --users alice,bob,carol --mutating \
-        --spreadsheet "$PWD/tests/treetest_veilfs_no_logging.csv"
+    (cd mnt && sudo python3 ./scripts/fuse_check.py tests/treetest/ --manifest tests/tree.json --users alice,bob,carol --mutating --spreadsheet tests/treetest_veilfs_no_logging.csv)
+    # python3 ./scripts/fuse_check.py "$MNT/tests/treetest/" \
+    #     --manifest "$PWD/tests/tree.json" \
+    #     --users alice,bob,carol --mutating \
+    #     --spreadsheet "$PWD/tests/treetest_veilfs_no_logging.csv"
     rm -rf tests/treetest/
     rm tests/tree.json
 done
@@ -78,10 +79,11 @@ fi
 echo "Running VeilFS tests with logging..."
 for i in $(seq 1 $1); do
     python3 scripts/gen_tree.py tests/treetest/ --seed $i --depth 10 --max-files 1000 --users alice,bob,carol --manifest tests/tree.json
-    python3 ./scripts/fuse_check.py "$MNT/tests/treetest/" \
-        --manifest "$PWD/tests/tree.json" \
-        --users alice,bob,carol --mutating \
-        --spreadsheet "$PWD/tests/treetest_veilfs_logging.csv"
+    (cd mnt && sudo python3 ./scripts/fuse_check.py tests/treetest/ --manifest tests/tree.json --users alice,bob,carol --mutating --spreadsheet tests/treetest_veilfs_logging.csv)
+    # python3 ./scripts/fuse_check.py "$MNT/tests/treetest/" \
+    #     --manifest "$PWD/tests/tree.json" \
+    #     --users alice,bob,carol --mutating \
+    #     --spreadsheet "$PWD/tests/treetest_veilfs_logging.csv"
     rm -rf tests/treetest/
     rm tests/tree.json
 done
