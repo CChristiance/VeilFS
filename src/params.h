@@ -13,6 +13,7 @@ struct veilfs_state {
     char *rootdir;        /* backing directory (usually root) */
     char *mountpoint;     /* where vfs is mounted */
     char *logpath;
+    char *log_rel;
     
     int root_fd;                /* file descriptor for root */
     int log_fd;                 /* file descriptor for current log file */

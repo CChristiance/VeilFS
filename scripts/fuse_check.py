@@ -40,6 +40,7 @@ Example:
 """
 import argparse
 import collections
+import csv
 import errno
 import json
 import os
@@ -321,6 +322,21 @@ def print_table(title, per_op):
     return total
 
 
+HEADERS = ["mount", "users", "file count", "depth", "file leaks",
+           "metadata leaks", "EACCES act/exp", "ENOENT act/exp", "OK act/exp",
+           "total mismatches", "wall time (s)", "total operations", "ops/sec"]
+
+
+def append_row(path, row):
+    """Append one row to a CSV file, writing the header if it is new/empty."""
+    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(HEADERS)
+        w.writerow(row)
+
+
 # --------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -347,6 +363,9 @@ def main():
     ap.add_argument("--show-mismatches", type=int, default=20,
                     help="max mismatches to print per user")
     ap.add_argument("--report", help="write full per-check results as JSON")
+    ap.add_argument("--spreadsheet",
+                    help="append the grand-total results as one row to this "
+                         ".csv file (created if missing) instead of printing them")
     args = ap.parse_args()
 
     CFG["policy"] = args.hide_policy
@@ -388,7 +407,8 @@ def main():
     full_report = {}
     exit_bad = False
 
-    total_ops = 0;
+    total_ops = 0
+    all_leaks = all_meta_leaks = 0
     start = time.perf_counter()
 
     for user in users:
@@ -397,7 +417,7 @@ def main():
         mismatches = []
         records = []
         leaks = missing = 0
-        meta_checked = meta_stripped = meta_bad = 0
+        meta_checked = meta_stripped = meta_bad = meta_leaks = 0
 
         for (path, op), (act, extra) in zip(plan, actual):
             exp = expected(op, path, user, entries)
@@ -422,6 +442,9 @@ def main():
                 probs = check_meta(entries[path], user, extra)
                 if probs:
                     meta_bad += 1
+                    if (not full_metadata(entries[path], user)
+                            and any(not p.startswith("mode") for p in probs)):
+                        meta_leaks += 1
                     mismatches.append(f"stat_meta {path}  " + "; ".join(probs))
 
             if op == "listdir" and act == 0 and extra is not None:
@@ -438,6 +461,8 @@ def main():
         end = time.perf_counter()
         user_total = sum(s.n for s in per_op.values())
         total_ops += user_total
+        all_leaks += leaks
+        all_meta_leaks += meta_leaks
 
         label = f"{user['name']} (uid {user['uid']})"
         total = print_table(label, per_op)
@@ -455,20 +480,42 @@ def main():
         if mismatches:
             exit_bad = True
 
-    if len(users) > 1:
-        overall = Stat()
-        for s in grand.values():
-            overall.add(s)
-        print_table("ALL USERS", {"all": overall})
+    overall = Stat()
+    for s in grand.values():
+        overall.add(s)
+    wall = end - start
 
     if args.report:
         with open(args.report, "w") as f:
             json.dump(full_report, f, indent=1)
 
     print("\nRESULT:", "MISMATCHES FOUND" if exit_bad else "all results match the oracle")
-    print(f"\nWALL TIME ELAPSED: {end - start:.6f} seconds")
-    print(f"\nTOTAL OPERATIONS: {total_ops:,}")
-    print(f"\nTHROUGHPUT (BASED OFF WALL TIME): {(total_ops / (end - start)):,.2f} ops/sec")
+
+    if args.spreadsheet:
+        files = [e for e in entries.values() if e["type"] == "file"]
+        depth = max((p.count("/") + 1 for p in entries if p != "."), default=0)
+        append_row(args.spreadsheet, [
+            mount,
+            ",".join(u["name"] for u in users),
+            len(files),
+            depth,
+            all_leaks,
+            all_meta_leaks,
+            f"{overall.act['EACCES']}/{overall.exp['EACCES']}",
+            f"{overall.act['ENOENT']}/{overall.exp['ENOENT']}",
+            f"{overall.act['OK']}/{overall.exp['OK']}",
+            overall.mismatch,
+            round(wall, 6),
+            total_ops,
+            round(total_ops / wall, 2),
+        ])
+        print(f"Appended results to {args.spreadsheet}")
+    else:
+        if len(users) > 1:
+            print_table("ALL USERS", {"all": overall})
+        print(f"\nWALL TIME ELAPSED: {wall:.6f} seconds")
+        print(f"\nTOTAL OPERATIONS: {total_ops:,}")
+        print(f"\nTHROUGHPUT (BASED OFF WALL TIME): {(total_ops / wall):,.2f} ops/sec")
     sys.exit(1 if exit_bad else 0)
 
 

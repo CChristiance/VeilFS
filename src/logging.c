@@ -71,7 +71,7 @@ void veilfs_log(struct fuse_context *context, const char *op, const char *path) 
     struct veilfs_state *state = context->private_data;
     // fprintf(stderr, "logpath = %s, log_fd = %d, path = %s\n", state->logpath, state->log_fd, path);
     if (state->log_fd < 0) return;
-    if (path && is_log_path(path, state->logpath)) return;
+    if (path && state->log_rel && is_log_path(path, state->log_rel)) return;
 
     state->log_fd = rotate_log_if_needed(state);
 
@@ -81,8 +81,8 @@ void veilfs_log(struct fuse_context *context, const char *op, const char *path) 
     char cmd[256];
     get_cmdline(context->pid, cmd, sizeof(cmd));
 
-    fprintf(stderr, "Logging: %s - uid=%d pid=%d op=%s path=%s cmd=%s\n",
-            timestamp, context->uid, (int)context->pid, op, path ? path : "-", cmd);
+    // fprintf(stderr, "Logging: %s - uid=%d pid=%d op=%s path=%s cmd=%s\n",
+    //         timestamp, context->uid, (int)context->pid, op, path ? path : "-", cmd);
 
     dprintf(state->log_fd, "%s - uid=%d pid=%d op=%s path=%s cmd=%s\n",
             timestamp, context->uid, (int)context->pid, op, path ? path : "-", cmd);
