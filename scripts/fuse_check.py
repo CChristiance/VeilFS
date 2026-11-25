@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
 """
-fuse_check.py - exercise a "hide-what-you-can't access" FUSE filesystem.
+fuse_check.py - exercise a "veil" FUSE filesystem and compare against an oracle.
 
 For every entry in the manifest produced by gen_tree.py, and for each test
 user, perform a set of file operations through the mount, record the errno
-actually returned, and compare it against an oracle of what the filesystem
-SHOULD return.
+actually returned, and compare it against what the filesystem SHOULD return.
 
-Oracle model (edit the constants / functions below if your FS differs):
-  * Resolving a path walks component by component. For each component:
-      - the parent directory needs search (x) permission  -> else EACCES
-      - the child must be "visible" to the user           -> else ENOENT
-    (order configurable with --order)
-  * Visibility is decided by --hide-policy:
-      read : user has r on the entry                (default)
-      any  : user has at least one of r/w/x on it
-      rx   : user has r or x on it
-      none : nothing is ever hidden (plain POSIX)
-  * If the path resolves, the operation itself needs normal POSIX permission
-    on the target, else EACCES.
-  * root (uid 0) bypasses all checks (ROOT_BYPASSES).
+Oracle model (matches veilfs):
+  * LOOKUP (getattr of the path): succeeds iff the user has ANY of r/w/x on the
+    entry itself, else ENOENT.  root always succeeds.
+  * METADATA: if lookup succeeds but the user lacks r on the entry, stat() is
+    stripped: size=0, nlink=0, blocks=0, atime/mtime/ctime=0,
+    uid=-1 unless the caller owns it, gid=-1 unless caller's gid matches.
+    st_mode is NOT stripped.  With r, everything is real.
+  * LISTING (readdir): only entries on which the user has r are listed.
+    ("." and ".." always are.)  A directory the user cannot read -> readdir
+    fails with --noread-dir-errno (default ENOENT, as in veilfs_readdir).
+  * OPERATIONS: once the path resolves, the op needs normal POSIX permission on
+    the target (open_r -> r, open_w -> w, chdir -> x, create/mkdir -> w+x on the
+    directory), else EACCES.
+  * Group match uses the caller's PRIMARY gid only (like veilfs_can_access),
+    unless --gid-match all.
+  * Path walk (--order):
+      no-parent-x  (default) only the final entry's visibility matters;
+                   x on ancestors is not checked (no default_permissions).
+      access-first x on each parent is checked first (EACCES), then the child's
+                   visibility (ENOENT) - what the kernel does with
+                   -o default_permissions.
+      hide-first   child's visibility (ENOENT) before parent x (EACCES).
+  * root (uid 0) bypasses everything.
 
 Must run as root to test as several users (it forks and drops privileges).
 The FUSE mount needs -o allow_other for other uids to reach it at all.
 
 Example:
     sudo ./fuse_check.py /mnt/fusefs --manifest tree.json --users alice,bob,carol
+    # sanity check of the harness itself on a plain directory:
+    sudo ./fuse_check.py /srv/backing --hide-policy none
 """
 import argparse
 import collections
@@ -33,15 +44,19 @@ import errno
 import json
 import os
 import pwd
+import stat as statmod
 import sys
+import time
 
 ROOT_BYPASSES = True
 R, W, X = 4, 2, 1
+# stripped uid/gid is (uid_t)-1; the kernel may present it as the overflow id
+ID_NONE = {0xFFFFFFFF, 65534}
 
 # op -> (applies to, permission bits needed on target, mutating?)
 OPS = {
     "stat":    ("any",  0,     False),
-    "open_r":  ("any",  R,     False),
+    "open_r":  ("file", R,     False),
     "open_w":  ("file", W,     False),
     "listdir": ("dir",  R,     False),
     "chdir":   ("dir",  X,     False),
@@ -49,7 +64,8 @@ OPS = {
     "mkdir":   ("dir",  W | X, True),
 }
 
-CLASSES = ("EACCES", "ENOENT", "OK")
+CFG = {"policy": "veil", "order": "no-parent-x", "gid_match": "primary",
+       "readdir_errno": errno.EACCES}
 
 
 # --------------------------------------------------------------------------
@@ -72,10 +88,20 @@ def resolve_user(spec):
 # --------------------------------------------------------------------------
 # oracle
 # --------------------------------------------------------------------------
+def is_root(user):
+    return ROOT_BYPASSES and user["uid"] == 0
+
+
+def gid_matches(entry, user):
+    if CFG["gid_match"] == "all":
+        return entry["gid"] in user["groups"]
+    return entry["gid"] == user["gid"]
+
+
 def perm_bits(entry, user):
     if entry["uid"] == user["uid"]:
         shift = 6
-    elif entry["gid"] in user["groups"]:
+    elif gid_matches(entry, user):
         shift = 3
     else:
         shift = 0
@@ -83,58 +109,108 @@ def perm_bits(entry, user):
 
 
 def can(entry, user, bit):
-    if ROOT_BYPASSES and user["uid"] == 0:
+    if is_root(user):
         if bit == X and entry["type"] == "file":
             return bool(entry["mode"] & 0o111)
         return True
     return bool(perm_bits(entry, user) & bit)
 
 
-def visible(entry, user, policy):
-    if policy == "none" or (ROOT_BYPASSES and user["uid"] == 0):
+def lookup_ok(entry, user):
+    """Can the user resolve this entry by name?  (any of r/w/x)"""
+    if CFG["policy"] == "none" or is_root(user):
         return True
-    bits = perm_bits(entry, user)
-    if policy == "read":
-        return bool(bits & R)
-    if policy == "any":
-        return bits != 0
-    if policy == "rx":
-        return bool(bits & (R | X))
-    raise ValueError(policy)
+    return perm_bits(entry, user) != 0
 
 
-def expected_lookup(path, user, entries, policy, order):
+def listed(entry, user):
+    """Does readdir of the parent show this entry?  (needs r)"""
+    if CFG["policy"] == "none" or is_root(user):
+        return True
+    return bool(perm_bits(entry, user) & R)
+
+
+def full_metadata(entry, user):
+    return (CFG["policy"] == "none" or is_root(user)
+            or bool(perm_bits(entry, user) & R))
+
+
+def expected_lookup(path, user, entries):
     """errno the path walk should produce, or 0 if it resolves."""
     if path == ".":
-        return 0
+        return 0 if lookup_ok(entries["."], user) else errno.ENOENT
     cur = entries["."]
     prefix = []
     for part in path.split("/"):
         prefix.append(part)
         child = entries["/".join(prefix)]
-        if order == "hide-first":
-            if not visible(child, user, policy):
+        order = CFG["order"]
+        if order == "access-first":
+            if not can(cur, user, X):
+                return errno.EACCES
+            if not lookup_ok(child, user):
+                return errno.ENOENT
+        elif order == "hide-first":
+            if not lookup_ok(child, user):
                 return errno.ENOENT
             if not can(cur, user, X):
                 return errno.EACCES
-        else:
-            if not can(cur, user, X):
-                return errno.EACCES
-            if not visible(child, user, policy):
+        else:  # no-parent-x
+            if not lookup_ok(child, user):
                 return errno.ENOENT
         cur = child
     return 0
 
 
-def expected(op, path, user, entries, policy, order):
-    err = expected_lookup(path, user, entries, policy, order)
+def expected(op, path, user, entries):
+    err = expected_lookup(path, user, entries)
     if err:
         return err
     need = OPS[op][1]
     for bit in (R, W, X):
         if need & bit and not can(entries[path], user, bit):
+            if op == "listdir" and bit == R and CFG["policy"] == "veil":
+                return CFG["readdir_errno"]
             return errno.EACCES
     return 0
+
+
+def check_meta(entry, user, st):
+    """Return a list of problems with the stat() result."""
+    probs = []
+    if st["mode"] != entry["mode"]:
+        probs.append(f"mode {oct(st['mode'])} != {oct(entry['mode'])}")
+    if full_metadata(entry, user):
+        if st["nlink"] == 0:
+            probs.append("nlink is 0 but user has r")
+        if st["uid"] != entry["uid"]:
+            probs.append(f"uid {st['uid']} != {entry['uid']}")
+        if st["gid"] != entry["gid"]:
+            probs.append(f"gid {st['gid']} != {entry['gid']}")
+        if entry["type"] == "file" and "size" in entry and st["size"] != entry["size"]:
+            probs.append(f"size {st['size']} != {entry['size']}")
+        if entry["type"] == "file" and "size" in entry and entry["size"] and st["blocks"] == 0:
+            probs.append("blocks is 0 but user has r")
+    else:
+        if st["size"] != 0:
+            probs.append(f"size {st['size']} not stripped")
+        if st["nlink"] != 0:
+            probs.append(f"nlink {st['nlink']} not stripped")
+        if st["blocks"] != 0:
+            probs.append(f"blocks {st['blocks']} not stripped")
+        if st["atime_ns"] or st["mtime_ns"] or st["ctime_ns"]:
+            probs.append("timestamps not zeroed")
+        if user["uid"] == entry["uid"]:
+            if st["uid"] != entry["uid"]:
+                probs.append(f"owner's uid {st['uid']} should be kept")
+        elif st["uid"] not in ID_NONE:
+            probs.append(f"uid {st['uid']} leaked (want -1)")
+        if user["gid"] == entry["gid"]:
+            if st["gid"] != entry["gid"]:
+                probs.append(f"matching gid {st['gid']} should be kept")
+        elif st["gid"] not in ID_NONE:
+            probs.append(f"gid {st['gid']} leaked (want -1)")
+    return probs
 
 
 # --------------------------------------------------------------------------
@@ -144,16 +220,20 @@ def execute(mount, plan):
     out = []
     for path, op in plan:
         p = mount if path == "." else os.path.join(mount, path)
-        names = None
+        extra = None
         try:
             if op == "stat":
-                os.lstat(p)
+                s = os.lstat(p)
+                extra = {"mode": statmod.S_IMODE(s.st_mode), "size": s.st_size,
+                         "nlink": s.st_nlink, "uid": s.st_uid, "gid": s.st_gid,
+                         "blocks": s.st_blocks, "atime_ns": s.st_atime_ns,
+                         "mtime_ns": s.st_mtime_ns, "ctime_ns": s.st_ctime_ns}
             elif op == "open_r":
                 os.close(os.open(p, os.O_RDONLY | os.O_NONBLOCK))
             elif op == "open_w":
                 os.close(os.open(p, os.O_WRONLY | os.O_NONBLOCK))
             elif op == "listdir":
-                names = sorted(os.listdir(p))
+                extra = sorted(os.listdir(p))
             elif op == "chdir":
                 os.chdir(p)
                 os.chdir("/")
@@ -168,7 +248,8 @@ def execute(mount, plan):
             err = 0
         except OSError as e:
             err = e.errno
-        out.append([err, names])
+            extra = None
+        out.append([err, extra])
     return out
 
 
@@ -249,12 +330,17 @@ def main():
     ap.add_argument("--users", default=None,
                     help="comma-separated usernames/uids to test as (default: "
                          "all owners in manifest + 65534 when root; else self)")
-    ap.add_argument("--hide-policy", choices=["read", "any", "rx", "none"],
-                    default="read")
-    ap.add_argument("--order", choices=["access-first", "hide-first"],
-                    default="access-first",
-                    help="whether a missing x on the parent (EACCES) or hiding "
-                         "of the child (ENOENT) takes precedence")
+    ap.add_argument("--hide-policy", choices=["veil", "none"], default="veil",
+                    help="'none' = oracle for a plain POSIX fs (harness sanity check)")
+    ap.add_argument("--order", choices=["no-parent-x", "access-first", "hide-first"],
+                    default="no-parent-x", help="see module docstring")
+    ap.add_argument("--gid-match", choices=["primary", "all"], default="primary",
+                    help="match entry gid against caller's primary gid only "
+                         "(veilfs) or all supplementary groups too")
+    ap.add_argument("--noread-dir-errno", choices=["ENOENT", "EACCES"],
+                    default="EACCES",
+                    help="errno for listdir on a directory the user can look up "
+                         "but not read")
     ap.add_argument("--mutating", action="store_true",
                     help="also test create/mkdir (creates and removes temp "
                          "entries inside writable directories)")
@@ -262,6 +348,11 @@ def main():
                     help="max mismatches to print per user")
     ap.add_argument("--report", help="write full per-check results as JSON")
     args = ap.parse_args()
+
+    CFG["policy"] = args.hide_policy
+    CFG["order"] = "access-first" if args.hide_policy == "none" else args.order
+    CFG["gid_match"] = "all" if args.hide_policy == "none" else args.gid_match
+    CFG["readdir_errno"] = getattr(errno, args.noread_dir_errno)
 
     with open(args.manifest) as f:
         manifest = json.load(f)
@@ -296,7 +387,9 @@ def main():
     grand = {}
     full_report = {}
     exit_bad = False
-    leak_totals = {}
+
+    total_ops = 0;
+    start = time.perf_counter()
 
     for user in users:
         actual = run_as(user, lambda: execute(mount, plan))
@@ -304,45 +397,60 @@ def main():
         mismatches = []
         records = []
         leaks = missing = 0
+        meta_checked = meta_stripped = meta_bad = 0
 
-        for (path, op), (act, names) in zip(plan, actual):
-            exp = expected(op, path, user, entries, args.hide_policy, args.order)
+        for (path, op), (act, extra) in zip(plan, actual):
+            exp = expected(op, path, user, entries)
             s = per_op[op]
             s.n += 1
             s.act[klass(act)] += 1
             s.exp[klass(exp)] += 1
             if act != exp:
                 s.mismatch += 1
-                mismatches.append((path, op, exp, act))
+                e = entries[path]
+                mismatches.append(
+                    f"{op:<8} {path}  expected={ename(exp)} actual={ename(act)}"
+                    f"  [{e['type']} uid={e['uid']} gid={e['gid']} "
+                    f"mode={oct(e['mode'])}; user uid={user['uid']} gid={user['gid']}]")
             records.append({"path": path, "op": op,
                             "expected": ename(exp), "actual": ename(act)})
 
-            if op == "listdir" and act == 0 and names is not None:
+            if op == "stat" and act == 0 and exp == 0 and extra:
+                meta_checked += 1
+                if not full_metadata(entries[path], user):
+                    meta_stripped += 1
+                probs = check_meta(entries[path], user, extra)
+                if probs:
+                    meta_bad += 1
+                    mismatches.append(f"stat_meta {path}  " + "; ".join(probs))
+
+            if op == "listdir" and act == 0 and extra is not None:
                 want = {n for n in children.get(path, [])
-                        if visible(entries[(path + "/" + n) if path != "." else n],
-                                   user, args.hide_policy)}
-                got = set(names)
+                        if listed(entries[(path + "/" + n) if path != "." else n], user)}
+                got = set(extra)
                 leaks += len(got - want)
                 missing += len(want - got)
                 for n in sorted(got - want):
-                    mismatches.append((f"{path}/{n}", "readdir_leak", 0, 0))
+                    mismatches.append(f"readdir_leak    {path}/{n}  (listed without r)")
                 for n in sorted(want - got):
-                    mismatches.append((f"{path}/{n}", "readdir_missing", 0, 0))
+                    mismatches.append(f"readdir_missing {path}/{n}  (has r but not listed)")
+
+        end = time.perf_counter()
+        user_total = sum(s.n for s in per_op.values())
+        total_ops += user_total
 
         label = f"{user['name']} (uid {user['uid']})"
         total = print_table(label, per_op)
         print(f"readdir: {leaks} entries listed that should be hidden, "
-              f"{missing} visible entries missing")
-        for path, op, exp, act in mismatches[:args.show_mismatches]:
-            if op.startswith("readdir_"):
-                print(f"  MISMATCH {op:<16} {path}")
-            else:
-                print(f"  MISMATCH {op:<8} {path}  expected={ename(exp)} actual={ename(act)}")
+              f"{missing} readable entries missing")
+        print(f"stat metadata: {meta_checked} checked ({meta_stripped} expected "
+              f"stripped), {meta_bad} wrong")
+        for m in mismatches[:args.show_mismatches]:
+            print("  MISMATCH", m)
         if len(mismatches) > args.show_mismatches:
             print(f"  ... {len(mismatches) - args.show_mismatches} more")
 
         grand[label] = total
-        leak_totals[label] = (leaks, missing)
         full_report[label] = records
         if mismatches:
             exit_bad = True
@@ -358,6 +466,9 @@ def main():
             json.dump(full_report, f, indent=1)
 
     print("\nRESULT:", "MISMATCHES FOUND" if exit_bad else "all results match the oracle")
+    print(f"\nWALL TIME ELAPSED: {end - start:.6f} seconds")
+    print(f"\nTOTAL OPERATIONS: {total_ops:,}")
+    print(f"\nTHROUGHPUT (BASED OFF WALL TIME): {(total_ops / (end - start)):,.2f} ops/sec")
     sys.exit(1 if exit_bad else 0)
 
 

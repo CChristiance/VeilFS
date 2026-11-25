@@ -63,8 +63,33 @@ static int under_mountpoint(const char *path, const struct veilfs_state *state) 
     return strncmp(path, state->mountpoint, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
+static inline void strip_metadata(const struct fuse_context *context, struct stat *stbuf) {
+    stbuf->st_size = 0;
+    stbuf->st_nlink = 0;
+    if (context->uid != stbuf->st_uid) stbuf->st_uid = -1;
+    if (context->gid != stbuf->st_gid) stbuf->st_gid = -1;
+    stbuf->st_size = 0;
+    stbuf->st_blocks = 0;
+
+# ifdef __USE_XOPEN2K8
+    stbuf->st_atim.tv_sec = 0;
+    stbuf->st_atim.tv_nsec = 0;
+    stbuf->st_mtim.tv_sec = 0;
+    stbuf->st_mtim.tv_nsec = 0;
+    stbuf->st_ctim.tv_sec = 0;
+    stbuf->st_ctim.tv_nsec = 0;
+#else
+    stbuf->st_atime = 0;
+    stbuf->st_atimensec = 0;
+    stbuf->st_mtime = 0;
+    stbuf->st_mtimensec = 0;
+    stbuf->st_ctime = 0;
+    stbuf->st_ctimensec = 0;
+# endif
+}
+
 /* Mask: 4 = read, 2 = write, 1 = execute */
-static inline const int veilfs_can_access(const struct stat *stbuf, const struct fuse_context *context, int mask) {
+static inline const int veilfs_can_access(struct stat *stbuf, const struct fuse_context *context, int mask) {
     if (context->uid == 0) return 1;    // allow root to always access
     
     mode_t bits;
@@ -73,6 +98,9 @@ static inline const int veilfs_can_access(const struct stat *stbuf, const struct
     if (context->uid == stbuf->st_uid) bits = (stbuf->st_mode >> 6) & 7;
     else if (context->gid == stbuf->st_gid) bits = (stbuf->st_mode >> 3) & 7;
     else bits = stbuf->st_mode & 7;
+
+    // no read permissions, so strip metadata
+    if (!(bits & R_OK)) strip_metadata(context, stbuf);
 
     return (bits & mask);
 }
@@ -102,7 +130,7 @@ static int veilfs_getattr(const char *path, struct stat *stbuf, struct fuse_file
     (void) fi;
     
     // hide mounting point to prevent recursion
-    if (under_mountpoint(path, state)) return -ENOENT;
+    if (state->needRecursionCheck && under_mountpoint(path, state)) return -ENOENT;
 
     // store file information from the real file location into stbuf
     res = fstatat(state->root_fd, rel_path(path), stbuf, AT_SYMLINK_NOFOLLOW);
@@ -112,13 +140,13 @@ static int veilfs_getattr(const char *path, struct stat *stbuf, struct fuse_file
     // directories show if they have either read or exec bits, files need read bit
     if (stbuf->st_mode & S_IFDIR) {
         if (!veilfs_can_access(stbuf, context, R_OK | W_OK | X_OK)) {
-            fprintf(stderr, "Logging in getattr\n");
+            // fprintf(stderr, "Logging in getattr\n");
             LOG_OP(path);
             return -ENOENT;
         }
     } else {
         if (!veilfs_can_access(stbuf, context, R_OK | W_OK | X_OK)) {
-            fprintf(stderr, "Logging in getattr\n");
+            // fprintf(stderr, "Logging in getattr\n");
             LOG_OP(path);
             return -ENOENT;
         }
@@ -310,6 +338,7 @@ static int veilfs_opendir(const char *path, struct fuse_file_info *fi) {
     struct veilfs_state *state = get_state();
     struct fuse_context *context = fuse_get_context();
     struct veilfs_dirp *d = malloc(sizeof(struct veilfs_dirp));
+    struct stat stbuf;
     if (d == NULL) return -ENOMEM;
 
     // get file descriptor
@@ -328,6 +357,15 @@ static int veilfs_opendir(const char *path, struct fuse_file_info *fi) {
         return -errno;
     }
 
+    // if (fi) res = fstat(dirfd(d->dp), &stbuf);
+    // else res = fstatat(state->root_fd, rel_path(path), &stbuf, AT_SYMLINK_NOFOLLOW);
+    // if (!veilfs_can_access(&stbuf, context, R_OK)) {
+    //     free(d);
+    //     close(fd);
+    //     // LOG_OP(path);
+    //     return -ENOENT;
+    // }
+
     d->offset = 0;
     d->entry = NULL;
 
@@ -338,9 +376,6 @@ static int veilfs_opendir(const char *path, struct fuse_file_info *fi) {
 static int veilfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 			struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
 
-    // (void) offset;
-    // (void) fi;
-    // (void) flags;
     (void) path;
     
     struct veilfs_state *state = get_state();
@@ -357,15 +392,6 @@ static int veilfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
         return -ENOENT;
     }
 
-    // int fd = openat(state->root_fd, rel_path(path), O_RDONLY | O_DIRECTORY);
-    // if (fd == -1) return -errno;
-
-    // DIR *dp = fdopendir(fd);
-    // if (!dp) {
-    //     close(fd);
-    //     return -errno;
-    // }
-
     rewinddir(d->dp);
 
     struct dirent *de;
@@ -377,7 +403,7 @@ static int veilfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
         char full[PATH_MAX];
         int len = snprintf(full, sizeof(full), "%s%s%s", state->rootdir, (state->rootdir[0] == '/' && state->rootdir[1] == '\0') ? "" : "/", de->d_name);
         if (len < 0 || (size_t)len >= sizeof(full)) continue;
-            if (under_mountpoint(full, state)) continue; // don't list out mount point
+            if (state->needRecursionCheck && under_mountpoint(full, state)) continue; // don't list out mount point
             if (fstatat(dirfd(d->dp), de->d_name, &entst, AT_SYMLINK_NOFOLLOW) == -1) continue;
             if (!veilfs_can_access(&entst, context, R_OK)) continue;
         }
@@ -464,10 +490,6 @@ static int veilfs_statfs(const char *path, struct statvfs *stbuf) {
 
 static int veilfs_release(const char *path, struct fuse_file_info *fi) {
     (void) path;
-    // (void) fi;
-
-    // struct veilfs_state *state = get_state();
-    // close(path);
 
     close(fi->fh);
 
@@ -559,13 +581,6 @@ const static struct fuse_operations veilfs_oper = {
 #endif
 };
 
-// TODO: write test cases
-// TODO: track # of files exposed to unprivileged users during tests
-    // Desired result: 0
-// TODO: track # of instances EACCES for privileged files is returned instead of ENOENT
-    // Desired result: 0
-// TODO: track # of times the tests bypassed the FUSE FS
-    // Desired result: 0
 // TODO: track throughput (wall-clock time and ops per second)
     // Desired result: At most 2x default wall-time and at least 50% of default ops per second
 int main(int argc, char *argv[]) {
@@ -611,8 +626,7 @@ int main(int argc, char *argv[]) {
 
         state->rootdir = realpath(opts.root ? opts.root : "/", NULL);
     if (!state->rootdir) {
-        fprintf(stderr, "Invalid root '%s': %s\n",
-                opts.root ? opts.root : "/", strerror(errno));
+        fprintf(stderr, "Invalid root '%s': %s\n", opts.root ? opts.root : "/", strerror(errno));
         goto out;
     }
     state->root_fd = open(state->rootdir, O_PATH | O_DIRECTORY | O_CLOEXEC);
@@ -623,8 +637,10 @@ int main(int argc, char *argv[]) {
 
     state->mountpoint = realpath(args.argv[args.argc - 1], NULL);
     if (!state->mountpoint) {
-        fprintf(stderr, "Invalid mountpoint '%s': %s\n",
-                args.argv[args.argc - 1], strerror(errno));
+        fprintf(stderr, "Invalid mountpoint '%s': %s\n", args.argv[args.argc - 1], strerror(errno));
+        goto out;
+    } else if (strcmp(state->mountpoint, "/") == 0) {
+        fprintf(stderr, "Mountpoint cannot be '/': %s\n", strerror(errno));
         goto out;
     }
     fprintf(stderr, "mountpoint: %s\nroot: %s\n", state->mountpoint, state->rootdir);
@@ -634,6 +650,19 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to insert FUSE args\n");
         goto out;
     }
+
+    /* check if recursion check is needed */
+    size_t n = strlen(state->rootdir);
+    int mntUnderRoot = 0;
+    if (strncmp(state->mountpoint, state->rootdir, n) == 0) {
+        if (n == 1 && state->rootdir[0] == '/') {
+            mntUnderRoot = 1;
+        } else {
+            char c = state->mountpoint[n];
+            mntUnderRoot = (c == '/');
+        }
+    }
+    state->needRecursionCheck = mntUnderRoot;
 
     fprintf(stderr, "Using FUSE library version: %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
     ret = fuse_main(args.argc, args.argv, &veilfs_oper, state);

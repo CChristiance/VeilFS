@@ -14,7 +14,7 @@ make
 # Running:
 While in the top-level project folder, run:
 ```bash
-sudo ./src/veilfs \[mountpoint\]
+sudo ./src/veilfs [-l | -lc PATH] [-r PATH] [FUSE options] MOUNTPOINT
 ```
 Important notes:
 * You need sudo access in both the location where VeilFS and mountpoint are located. For example, if either is on an NFS where you lack sudo access, execution will fail.

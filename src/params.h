@@ -16,6 +16,8 @@ struct veilfs_state {
     
     int root_fd;                /* file descriptor for root */
     int log_fd;                 /* file descriptor for current log file */
+
+    int needRecursionCheck;     /* true if mountpoint exists under root, otherwise false */
 };
 
 struct veilfs_dirp {

@@ -3,7 +3,7 @@
 gen_tree.py - generate a randomized file tree with mixed owners, groups and
 permissions, plus a JSON manifest describing it.
 
-Run this against the BACKING directory of your FUSE filesystem (or against the
+Run this against the backing directory of the FUSE filesystem (or against the
 mount as root, if root sees everything). Must run as root if you want more than
 one owner.
 
@@ -34,7 +34,11 @@ def resolve_user(spec):
         except KeyError:
             return {"uid": uid, "name": str(uid), "gid": uid, "groups": [uid]}
     except ValueError:
-        pw = pwd.getpwnam(spec)
+        try:
+            pw = pwd.getpwnam(spec)
+        except KeyError:
+            sys.exit(f"error: user '{spec}' does not exist on this system "
+                     f"(create it, e.g. 'sudo useradd -M {spec}', or pass numeric uids)")
     groups = sorted(set(os.getgrouplist(pw.pw_name, pw.pw_gid)))
     return {"uid": pw.pw_uid, "name": pw.pw_name, "gid": pw.pw_gid,
             "groups": groups}
@@ -94,11 +98,13 @@ def main():
             counter += 1
             name = f"f{counter:04d}.dat"
             crel = name if rel == "." else f"{rel}/{name}"
+            data = rng.randbytes(rng.randint(1, 256))
             with open(os.path.join(absd, name), "wb") as f:
-                f.write(rng.randbytes(rng.randint(0, 256)))
+                f.write(data)
             uid, gid = pick_owner()
             entries.append({"path": crel, "type": "file", "uid": uid,
-                            "gid": gid, "mode": rng.choice(FILE_MODES)})
+                            "gid": gid, "mode": rng.choice(FILE_MODES),
+                            "size": len(data)})
             files_left -= 1
 
         if level < args.depth:

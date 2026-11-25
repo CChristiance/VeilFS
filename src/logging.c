@@ -69,7 +69,7 @@ static int rotate_log_if_needed(struct veilfs_state *state) {
 // log timestamp, user info, invoked syscall, and file/directory they tried to access
 void veilfs_log(struct fuse_context *context, const char *op, const char *path) {
     struct veilfs_state *state = context->private_data;
-    fprintf(stderr, "logpath = %s, log_fd = %d, path = %s\n", state->logpath, state->log_fd, path);
+    // fprintf(stderr, "logpath = %s, log_fd = %d, path = %s\n", state->logpath, state->log_fd, path);
     if (state->log_fd < 0) return;
     if (path && is_log_path(path, state->logpath)) return;
 
