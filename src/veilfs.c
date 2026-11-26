@@ -80,30 +80,6 @@ static int is_mountpoint_path(const char *path, const struct veilfs_state *state
     return under_mountpoint(full, state);
 }
 
-static inline void strip_metadata(const struct fuse_context *context, struct stat *stbuf) {
-    stbuf->st_size = 0;
-    stbuf->st_nlink = 0;
-    if (context->uid != stbuf->st_uid) stbuf->st_uid = -1;
-    if (!caller_in_group(context, stbuf->st_gid)) stbuf->st_gid = -1;
-    stbuf->st_blocks = 0;
-
-# ifdef __USE_XOPEN2K8
-    stbuf->st_atim.tv_sec = 0;
-    stbuf->st_atim.tv_nsec = 0;
-    stbuf->st_mtim.tv_sec = 0;
-    stbuf->st_mtim.tv_nsec = 0;
-    stbuf->st_ctim.tv_sec = 0;
-    stbuf->st_ctim.tv_nsec = 0;
-#else
-    stbuf->st_atime = 0;
-    stbuf->st_atimensec = 0;
-    stbuf->st_mtime = 0;
-    stbuf->st_mtimensec = 0;
-    stbuf->st_ctime = 0;
-    stbuf->st_ctimensec = 0;
-# endif
-}
-
 #define GROUP_CACHE_TTL 5   /* seconds before re-reading the group database */
 
 /* Check if the caller belongs to `gid`, as primary or supplementary group.
@@ -148,6 +124,30 @@ static int caller_in_group(const struct fuse_context *context, gid_t gid) {
     for (int i = 0; i < c_n; i++)
         if (c_groups[i] == gid) return 1;
     return 0;
+}
+
+static inline void strip_metadata(const struct fuse_context *context, struct stat *stbuf) {
+    stbuf->st_size = 0;
+    stbuf->st_nlink = 0;
+    if (context->uid != stbuf->st_uid) stbuf->st_uid = -1;
+    if (!caller_in_group(context, stbuf->st_gid)) stbuf->st_gid = -1;
+    stbuf->st_blocks = 0;
+
+# ifdef __USE_XOPEN2K8
+    stbuf->st_atim.tv_sec = 0;
+    stbuf->st_atim.tv_nsec = 0;
+    stbuf->st_mtim.tv_sec = 0;
+    stbuf->st_mtim.tv_nsec = 0;
+    stbuf->st_ctim.tv_sec = 0;
+    stbuf->st_ctim.tv_nsec = 0;
+#else
+    stbuf->st_atime = 0;
+    stbuf->st_atimensec = 0;
+    stbuf->st_mtime = 0;
+    stbuf->st_mtimensec = 0;
+    stbuf->st_ctime = 0;
+    stbuf->st_ctimensec = 0;
+# endif
 }
 
 /* Mask: 4 = read, 2 = write, 1 = execute */
