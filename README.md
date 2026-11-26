@@ -22,7 +22,7 @@ make
 ```
 
 ## Automated Test:
-The results for this automated test are already present in tests/*.csv. Running this test again will append extra rows onto each .csv.
+The results for this automated test are already present in tests/*.csv. Running this test again will append extra rows onto each .csv. Testing was replicated on VM on NCSU's VCL running linux version 6.8.0-54-generic.
 
 Before running the automated test, run this script:
 ```bash
