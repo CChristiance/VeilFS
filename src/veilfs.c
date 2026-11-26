@@ -26,19 +26,77 @@
 #include <pwd.h>
 #include <grp.h>
 #include <time.h>
+#include <sys/syscall.h>
 
 struct saved_ids { uid_t uid; gid_t gid; };
 
 /* ===== HELPER FUNCTIONS ===== */
+
+#define GROUP_CACHE_TTL 5
+
+static __thread uid_t  c_uid;
+static __thread time_t c_time;
+static __thread gid_t *c_groups;
+static __thread int    c_n;
+static __thread int    c_valid;
+
+/* Daemon's own supplementary groups, captured in main() before fuse_main */
+static gid_t daemon_groups[256];
+static int   n_daemon_groups;
+
+/* All groups of the caller (primary + supplementary), cached per thread. */
+static int caller_groups(const struct fuse_context *context, gid_t **out) {
+    time_t now = time(NULL);
+    if (!c_valid || c_uid != context->uid || now - c_time >= GROUP_CACHE_TTL) {
+        free(c_groups);
+        c_groups = NULL;
+        c_n = 0;
+
+        struct passwd pw, *res = NULL;
+        char buf[4096];
+        if (getpwuid_r(context->uid, &pw, buf, sizeof(buf), &res) == 0 && res) {
+            int n = 32;
+            gid_t *g = malloc(n * sizeof(*g));
+            while (g) {
+                int cap = n;
+                int r = getgrouplist(res->pw_name, res->pw_gid, g, &cap);
+                if (r != -1) { c_n = r; break; }
+                n = (cap > n) ? cap : n * 2;
+                gid_t *t = realloc(g, n * sizeof(*g));
+                if (!t) { free(g); g = NULL; break; }
+                g = t;
+            }
+            c_groups = g;
+        }
+        c_uid = context->uid;
+        c_time = now;
+        c_valid = 1;
+    }
+    *out = c_groups;
+    return c_n;
+}
+
+static int caller_in_group(const struct fuse_context *context, gid_t gid) {
+    if (context->gid == gid) return 1;
+    gid_t *g;
+    int n = caller_groups(context, &g);
+    for (int i = 0; i < n; i++)
+        if (g[i] == gid) return 1;
+    return 0;
+}
 
 /* Save uid and gid of daemon; required for each callback modifying the FS
    Omitting save_ids and restore_ids from such a callback creates a critical vulnerability
    when running VeilFS as root. */
 static inline const void save_ids(struct saved_ids *s) {
     struct fuse_context *context = fuse_get_context();
+    gid_t *g;
+    int n = caller_groups(context, &g);
+    syscall(SYS_setgroups, (size_t) n, g);   /* per-thread, unlike setgroups() */
     s->uid = setfsuid(context->uid);
     s->gid = setfsgid(context->gid);
 }
+
 
 /* Restore uid and gid of daemon; required for each callback modifying the FS
    Omitting save_ids and restore_ids from such a callback creates a critical vulnerability
@@ -46,6 +104,7 @@ static inline const void save_ids(struct saved_ids *s) {
 static inline const void restore_ids(struct saved_ids *s) {
     setfsuid(s->uid);
     setfsgid(s->gid);
+    syscall(SYS_setgroups, (size_t) n_daemon_groups, daemon_groups);
 }
 
 static inline struct veilfs_state *get_state(void) {
@@ -78,52 +137,6 @@ static int is_mountpoint_path(const char *path, const struct veilfs_state *state
     if (len < 0 || (size_t)len >= sizeof(full)) return 0;
 
     return under_mountpoint(full, state);
-}
-
-#define GROUP_CACHE_TTL 5   /* seconds before re-reading the group database */
-
-/* Check if the caller belongs to `gid`, as primary or supplementary group.
-   Uses a small per-thread cache so getattr/readdir don't hit the group
-   database on every call. */
-static int caller_in_group(const struct fuse_context *context, gid_t gid) {
-    if (context->gid == gid) return 1;
-
-    static __thread uid_t   c_uid;
-    static __thread time_t  c_time;
-    static __thread gid_t  *c_groups;
-    static __thread int     c_n;
-    static __thread int     c_valid;
-
-    time_t now = time(NULL);
-    if (!c_valid || c_uid != context->uid || now - c_time >= GROUP_CACHE_TTL) {
-        free(c_groups);
-        c_groups = NULL;
-        c_n = 0;
-
-        struct passwd pw, *res = NULL;
-        char buf[4096];
-        if (getpwuid_r(context->uid, &pw, buf, sizeof(buf), &res) == 0 && res) {
-            int n = 32;
-            gid_t *g = malloc(n * sizeof(*g));
-            while (g) {
-                int cap = n;
-                int r = getgrouplist(res->pw_name, res->pw_gid, g, &cap);
-                if (r != -1) { c_n = r; break; }
-                n = (cap > n) ? cap : n * 2;
-                gid_t *t = realloc(g, n * sizeof(*g));
-                if (!t) { free(g); g = NULL; break; }
-                g = t;
-            }
-            c_groups = g;
-        }
-        c_uid = context->uid;
-        c_time = now;
-        c_valid = 1;
-    }
-
-    for (int i = 0; i < c_n; i++)
-        if (c_groups[i] == gid) return 1;
-    return 0;
 }
 
 static inline void strip_metadata(const struct fuse_context *context, struct stat *stbuf) {
@@ -591,6 +604,8 @@ int main(int argc, char *argv[]) {
 
     // prevent daemon's mask from stripping perms
     umask(0);
+    n_daemon_groups = getgroups(256, daemon_groups);
+    if (n_daemon_groups < 0) n_daemon_groups = 0;
 
     /* in order for sudo to work, the daemon must have root privileges */
     /* allow the program to run, but send an alert */
