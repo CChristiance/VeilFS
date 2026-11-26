@@ -206,7 +206,7 @@ def check_meta(entry, user, st):
                 probs.append(f"owner's uid {st['uid']} should be kept")
         elif st["uid"] not in ID_NONE:
             probs.append(f"uid {st['uid']} leaked (want -1)")
-        if user["gid"] == entry["gid"]:
+        if gid_matches(entry, user):
             if st["gid"] != entry["gid"]:
                 probs.append(f"matching gid {st['gid']} should be kept")
         elif st["gid"] not in ID_NONE:
@@ -350,7 +350,7 @@ def main():
                     help="'none' = oracle for a plain POSIX fs (harness sanity check)")
     ap.add_argument("--order", choices=["no-parent-x", "access-first", "hide-first"],
                     default="access-first", help="see module docstring")
-    ap.add_argument("--gid-match", choices=["primary", "all"], default="primary",
+    ap.add_argument("--gid-match", choices=["primary", "all"], default="all",
                     help="match entry gid against caller's primary gid only "
                          "(veilfs) or all supplementary groups too")
     ap.add_argument("--noread-dir-errno", choices=["ENOENT", "EACCES"],

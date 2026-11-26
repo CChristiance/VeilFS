@@ -24,12 +24,14 @@ make
 ## Automated Test:
 Before running the automated test, run this script:
 ```bash
+sudo chmod o+x ./scripts/create_users.sh
 sudo ./scripts/create_users.sh
 ```
 * Rarely, this script will hang. If it does, kill it with ctrl+c and run it again. Repeat this process until all three users (alice, bob, carol) are added.
 
 To perform the same tests used in the report, while in the top-level project folder (VeilFS), run:
 ```bash
+sudo chmod o+x ./scripts/repeat_test.sh
 sudo ./scripts/repeat_test.sh 10
 ```
 This will perform the following test 10 times under the normal filesystem, VeilFS without logging, and VeilFS with logging:

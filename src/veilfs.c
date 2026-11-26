@@ -84,8 +84,7 @@ static inline void strip_metadata(const struct fuse_context *context, struct sta
     stbuf->st_size = 0;
     stbuf->st_nlink = 0;
     if (context->uid != stbuf->st_uid) stbuf->st_uid = -1;
-    if (context->gid != stbuf->st_gid) stbuf->st_gid = -1;
-    stbuf->st_size = 0;
+    if (!caller_in_group(context, stbuf->st_gid)) stbuf->st_gid = -1;
     stbuf->st_blocks = 0;
 
 # ifdef __USE_XOPEN2K8
