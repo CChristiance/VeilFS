@@ -23,6 +23,9 @@
 #include <sys/fsuid.h>
 #include <sched.h>
 #include <fuse.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
 
 struct saved_ids { uid_t uid; gid_t gid; };
 
@@ -102,15 +105,61 @@ static inline void strip_metadata(const struct fuse_context *context, struct sta
 # endif
 }
 
+#define GROUP_CACHE_TTL 5   /* seconds before re-reading the group database */
+
+/* Check if the caller belongs to `gid`, as primary or supplementary group.
+   Uses a small per-thread cache so getattr/readdir don't hit the group
+   database on every call. */
+static int caller_in_group(const struct fuse_context *context, gid_t gid) {
+    if (context->gid == gid) return 1;
+
+    static __thread uid_t   c_uid;
+    static __thread time_t  c_time;
+    static __thread gid_t  *c_groups;
+    static __thread int     c_n;
+    static __thread int     c_valid;
+
+    time_t now = time(NULL);
+    if (!c_valid || c_uid != context->uid || now - c_time >= GROUP_CACHE_TTL) {
+        free(c_groups);
+        c_groups = NULL;
+        c_n = 0;
+
+        struct passwd pw, *res = NULL;
+        char buf[4096];
+        if (getpwuid_r(context->uid, &pw, buf, sizeof(buf), &res) == 0 && res) {
+            int n = 32;
+            gid_t *g = malloc(n * sizeof(*g));
+            while (g) {
+                int cap = n;
+                int r = getgrouplist(res->pw_name, res->pw_gid, g, &cap);
+                if (r != -1) { c_n = r; break; }
+                n = (cap > n) ? cap : n * 2;
+                gid_t *t = realloc(g, n * sizeof(*g));
+                if (!t) { free(g); g = NULL; break; }
+                g = t;
+            }
+            c_groups = g;
+        }
+        c_uid = context->uid;
+        c_time = now;
+        c_valid = 1;
+    }
+
+    for (int i = 0; i < c_n; i++)
+        if (c_groups[i] == gid) return 1;
+    return 0;
+}
+
 /* Mask: 4 = read, 2 = write, 1 = execute */
 static inline const int veilfs_can_access(struct stat *stbuf, const struct fuse_context *context, int mask) {
     if (context->uid == 0) return 1;    // allow root to always access
-    
+
     mode_t bits;
 
-    // get the three relevant permission bits (8-6 for uid match, 5-3 for gid match, else 2-0)
+    // owner class, else group class (primary or supplementary), else other
     if (context->uid == stbuf->st_uid) bits = (stbuf->st_mode >> 6) & 7;
-    else if (context->gid == stbuf->st_gid) bits = (stbuf->st_mode >> 3) & 7;
+    else if (caller_in_group(context, stbuf->st_gid)) bits = (stbuf->st_mode >> 3) & 7;
     else bits = stbuf->st_mode & 7;
 
     // no read permissions, so strip metadata
@@ -535,8 +584,6 @@ const static struct fuse_operations veilfs_oper = {
 #endif
 };
 
-// TODO: track throughput (wall-clock time and ops per second)
-    // Desired result: At most 2x default wall-time and at least 50% of default ops per second
 int main(int argc, char *argv[]) {
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     struct cli_opts opts = {0};
