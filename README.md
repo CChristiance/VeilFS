@@ -22,6 +22,8 @@ make
 ```
 
 ## Automated Test:
+The results for this automated test are already present in tests/*.csv. Running this test again will append extra rows onto each .csv.
+
 Before running the automated test, run this script:
 ```bash
 sudo chmod o+x ./scripts/create_users.sh
