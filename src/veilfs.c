@@ -608,7 +608,6 @@ int main(int argc, char *argv[]) {
     if (n_daemon_groups < 0) n_daemon_groups = 0;
 
     /* in order for sudo to work, the daemon must have root privileges */
-    /* allow the program to run, but send an alert */
     int fd = -1;
     if (geteuid() != 0) {
         fprintf(stderr, "VeilFS daemon requires root privileges.\n");
