@@ -13,6 +13,9 @@ This project requires fuse3 to be installed to run. To install, run:
 sudo apt update && sudo apt install libfuse3-dev
 ```
 
+## System:
+Testing was performed on NCSU's VCL (XINU+QEMU (CSC 501 new)) running linux version 6.8.0-54-generic.
+
 ## Building:
 While in the top-level project folder, run:
 ```bash
@@ -85,4 +88,4 @@ mount | grep veilfs
 If VeilFS is not present for that mount point, then the unmounting was successful.
 
 ## Figures and Tables:
-All data was collected with fuse_check.py, which runs on a filetree produced by gen_tree.py. The script repeat_test.sh automates this process.
+All data was collected with fuse_check.py, which runs on a filetree produced by gen_tree.py. The script repeat_test.sh automates this process. The data used from these tests were used to create tables and charts in google sheets.
